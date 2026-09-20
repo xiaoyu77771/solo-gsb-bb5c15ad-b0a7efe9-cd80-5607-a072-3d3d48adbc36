@@ -16,6 +16,7 @@ from .image_merkle import build_merkle_manifest
 from .image_merge import MergeSource, merge_images
 from .layout import Region, validate_layout
 from .pattern_scan import PatternSpec, compile_patterns, scan_patterns
+from .page_crc import MAX_PAGES, inject_page_crc
 from .relocation import plan_relocation
 from .flash_update import plan_flash_update
 from .flash_verify import (
@@ -58,7 +59,12 @@ app = FastAPI(
         "with optional per-pattern half-open address range, alignment "
         "and expected hit count; hits are returned ordered by address "
         "then pattern input order with absent/unique/ambiguous/"
-        "count_mismatch statuses."
+        "count_mismatch statuses. It can also inject a per-page IEEE "
+        "CRC-32 table into a page-aligned range: pages materialize "
+        "missing bytes as 0xFF, every page CRC sees the whole table "
+        "region as 0xFF, the little-endian table is merged into the "
+        "image, and the result is returned as normalized Intel HEX with "
+        "per-page CRCs and final segment summaries."
     ),
 )
 
@@ -1154,6 +1160,145 @@ class ScanBytePatternsResponse(BaseModel):
     diagnostics: list[DiagnosticOut]
 
 
+class InjectPageCrcRequest(BaseModel):
+    hex_text: str = Field(..., description="Intel HEX text, one record per line")
+    range_start: int = Field(
+        ..., ge=0, description="Inclusive start of the paged range; 32-bit, page-aligned"
+    )
+    range_end: int = Field(
+        ...,
+        ge=0,
+        description="Exclusive end of the paged range; 32-bit, page-aligned, > range_start",
+    )
+    page_size: int = Field(
+        ..., ge=1, description="Uniform page size in bytes; the range is split into such pages"
+    )
+    table_address: int = Field(
+        ..., ge=0, description="32-bit, 4-byte aligned start of the little-endian CRC table"
+    )
+    max_data_bytes: int = Field(
+        16,
+        ge=1,
+        le=255,
+        description="Maximum payload bytes per emitted data record in the normalized HEX output",
+    )
+    include_entry: bool = Field(
+        True,
+        description=(
+            "Whether a start linear address record (type 05) preserving the "
+            "entry address is appended before the EOF record (default true)"
+        ),
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "hex_text": (
+                        ":020000040800F2\n"
+                        ":100000000102030405060708090A0B0C0D0E0F1068\n"
+                        ":00000001FF\n"
+                    ),
+                    "range_start": 134217728,
+                    "range_end": 134217760,
+                    "page_size": 16,
+                    "table_address": 134217744,
+                    "max_data_bytes": 16,
+                    "include_entry": True,
+                }
+            ]
+        }
+    }
+
+
+class PageCrcParamErrorOut(BaseModel):
+    kind: str = Field(
+        ...,
+        description=(
+            "invalid_range | range_unaligned | table_address_unaligned | "
+            "table_out_of_range | table_region_not_empty | too_many_pages"
+        ),
+    )
+    message: str
+    start: int | None = Field(None, description="Range or run start, when relevant")
+    end: int | None = Field(None, description="Exclusive range or run end, when relevant")
+    address: int | None = Field(None, description="The offending address, if any")
+
+
+class PageCrcOut(BaseModel):
+    index: int = Field(..., description="Zero-based page index in address order")
+    start: int = Field(..., description="Absolute page start address")
+    end: int = Field(..., description="Exclusive page end address")
+    size: int = Field(..., description="Always page_size")
+    present_bytes: int = Field(
+        ...,
+        description=(
+            "Bytes explicitly carried by the HEX inside this page; the table "
+            "region is never counted here and is read as 0xFF for CRCs"
+        ),
+    )
+    crc32: int = Field(
+        ..., description="Unsigned 32-bit IEEE CRC-32 of the materialized page (table area = 0xFF)"
+    )
+
+
+class InjectPageCrcResponse(BaseModel):
+    ok: bool = Field(
+        ...,
+        description="True when the HEX parses and every range/table parameter is valid",
+    )
+    hex_ok: bool = Field(..., description="True when the Intel HEX text passed validation")
+    params_valid: bool | None = Field(
+        ...,
+        description="True when range alignment, table placement and the blank-table "
+        "rule are valid; null when the parameter check did not run (invalid HEX)",
+    )
+    error_count: int
+    warning_count: int
+    entry_address: int | None = Field(None, description="From the last 03/05 record, if present")
+    total_bytes: int = Field(
+        ..., description="Distinct explicit bytes of the original image (0 when parsing failed)"
+    )
+    range_start: int
+    range_end: int
+    page_size: int
+    page_count: int = Field(..., description="Number of pages materialized (0 on failure)")
+    table_address: int
+    table_end: int = Field(
+        ..., description="Exclusive end of the table (table_address + 4*page_count when computed)"
+    )
+    max_pages: int = Field(..., description="Hard cap on page_count (1048576)")
+    max_data_bytes: int = Field(..., description="Echoes the requested data-record byte cap")
+    include_entry: bool = Field(..., description="Echoes the request")
+    pages: list[PageCrcOut] = Field(
+        ..., description="One CRC per page in address order; empty on failure"
+    )
+    exported_hex: str | None = Field(
+        None,
+        description=(
+            "Normalized Intel HEX of the image with the little-endian CRC table "
+            "merged in; null on failure"
+        ),
+    )
+    record_count: int = Field(..., description="Total emitted records including EOF (0 on failure)")
+    data_record_count: int = Field(..., description="Emitted type 00 records")
+    extended_address_record_count: int = Field(..., description="Emitted type 04 records")
+    entry_record_count: int = Field(..., description="Emitted type 05 records (0 or 1)")
+    segment_count: int = Field(
+        ..., description="Contiguous segments of the final image (0 on failure)"
+    )
+    injected_total_bytes: int = Field(
+        ..., description="Distinct explicit bytes of the final image, including the table"
+    )
+    segments: list[SegmentOut] = Field(
+        ..., description="Final image segments after merging the CRC table; empty on failure"
+    )
+    param_errors: list[PageCrcParamErrorOut] = Field(
+        ..., description="Parameter-level problems; non-empty only when params_valid is false"
+    )
+    diagnostics: list[DiagnosticOut]
+
+
 def _build_response(result: ParseResult) -> AssembleResponse:
     return AssembleResponse(
         ok=result.ok,
@@ -2112,5 +2257,142 @@ def scan_byte_patterns_route(request: ScanBytePatternsRequest) -> ScanBytePatter
             for r in result.reports
         ],
         pattern_errors=[],
+        **base_fields,
+    )
+
+
+@app.post(
+    "/api/v1/inject-page-crc",
+    response_model=InjectPageCrcResponse,
+    tags=["crc"],
+)
+def inject_page_crc_route(request: InjectPageCrcRequest) -> InjectPageCrcResponse:
+    """Inject a per-page IEEE CRC-32 table into a paged firmware range.
+
+    The HEX text is parsed with the shared validator and the same
+    diagnostics are returned. When parsing fails no parameter check runs
+    (``params_valid`` null) and no image or HEX is produced. Otherwise
+    the half-open range ``[range_start, range_end)`` must lie inside the
+    32-bit address space, be non-empty and have both endpoints aligned to
+    ``page_size``; at most 1,048,576 pages are allowed.
+    ``table_address`` must be 4-byte aligned, and the whole little-endian
+    table of ``4`` bytes per page must lie inside the range; the table
+    region must be blank in the input (no explicit image byte, including
+    an explicit ``0xFF``). Missing bytes in every page materialize as
+    ``0xFF``; while the pages are checksummed the *entire* table region
+    reads as ``0xFF``. Each page yields one standard IEEE CRC-32
+    (``zlib.crc32``), written as a little-endian 32-bit word in page
+    order. On success the table is merged into the image, which is
+    returned both as normalized Intel HEX text (same export rules as
+    ``/api/v1/export-hex``) and as final contiguous segments, alongside
+    the per-page CRCs.
+    """
+    parsed = parse_intel_hex(request.hex_text)
+    diagnostics = [DiagnosticOut(**vars(d)) for d in parsed.diagnostics]
+    base_fields = dict(
+        error_count=parsed.error_count,
+        warning_count=parsed.warning_count,
+        entry_address=parsed.entry_address,
+        total_bytes=parsed.total_bytes,
+        range_start=request.range_start,
+        range_end=request.range_end,
+        page_size=request.page_size,
+        table_address=request.table_address,
+        max_data_bytes=request.max_data_bytes,
+        include_entry=request.include_entry,
+        diagnostics=diagnostics,
+    )
+    if not parsed.ok:
+        return InjectPageCrcResponse(
+            ok=False,
+            hex_ok=False,
+            params_valid=None,
+            page_count=0,
+            table_end=request.table_address,
+            max_pages=MAX_PAGES,
+            pages=[],
+            exported_hex=None,
+            record_count=0,
+            data_record_count=0,
+            extended_address_record_count=0,
+            entry_record_count=0,
+            segment_count=0,
+            injected_total_bytes=0,
+            segments=[],
+            param_errors=[],
+            **base_fields,
+        )
+
+    injected = inject_page_crc(
+        parsed.segments,
+        request.range_start,
+        request.range_end,
+        request.page_size,
+        request.table_address,
+    )
+    if not injected.params_valid:
+        return InjectPageCrcResponse(
+            ok=False,
+            hex_ok=True,
+            params_valid=False,
+            page_count=injected.page_count,
+            table_end=injected.table_end,
+            max_pages=MAX_PAGES,
+            pages=[],
+            exported_hex=None,
+            record_count=0,
+            data_record_count=0,
+            extended_address_record_count=0,
+            entry_record_count=0,
+            segment_count=0,
+            injected_total_bytes=0,
+            segments=[],
+            param_errors=[
+                PageCrcParamErrorOut(**vars(e)) for e in injected.param_errors
+            ],
+            **base_fields,
+        )
+
+    exported = export_intel_hex(
+        injected.segments,
+        parsed.entry_address,
+        max_data_bytes=request.max_data_bytes,
+        include_entry=request.include_entry,
+    )
+    return InjectPageCrcResponse(
+        ok=True,
+        hex_ok=True,
+        params_valid=True,
+        page_count=injected.page_count,
+        table_end=injected.table_end,
+        max_pages=MAX_PAGES,
+        pages=[
+            PageCrcOut(
+                index=page.index,
+                start=page.start,
+                end=page.end,
+                size=page.size,
+                present_bytes=page.present_bytes,
+                crc32=page.crc32,
+            )
+            for page in injected.pages
+        ],
+        exported_hex=exported.hex_text,
+        record_count=exported.record_count,
+        data_record_count=exported.data_record_count,
+        extended_address_record_count=exported.extended_address_record_count,
+        entry_record_count=exported.entry_record_count,
+        segment_count=len(injected.segments),
+        injected_total_bytes=sum(len(s.data) for s in injected.segments),
+        segments=[
+            SegmentOut(
+                start=s.start,
+                end=s.end,
+                size=len(s.data),
+                data_base64=base64.b64encode(s.data).decode("ascii"),
+            )
+            for s in injected.segments
+        ],
+        param_errors=[],
         **base_fields,
     )

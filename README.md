@@ -19,7 +19,11 @@ Intel HEX 映像按绝对地址叠加合并（同值归并并记录全部来源�
 的模式（两位十六进制字节、`??` 单字节通配符与紧随的 `{n}` 重复）先编译为 value/mask
 序列，再只在连续固件段内查找（命中不跨空洞、允许重叠命中），每个模式可分别指定半开
 地址范围、地址对齐与期望命中数，命中按地址与模式输入顺序返回，并给出
-absent/unique/ambiguous/count_mismatch 状态。
+absent/unique/ambiguous/count_mismatch 状态；还能在按 `page_size` 对齐的地址范围内
+**按页注入 IEEE CRC-32 校验表**（页内缺失字节按 `0xFF` 物化、计算所有页 CRC 时
+整个表区一律视为 `0xFF`、每页一条小端 32 位 CRC），校验表必须完整位于范围内、
+4 字节对齐且表区在原映像中完全空白，成功后把小端 CRC 表并入映像，返回规范化
+HEX、逐页 CRC 与最终段摘要。
 
 ## 快速启动（单条命令）
 
@@ -984,6 +988,113 @@ curl -s -X POST http://localhost:8000/api/v1/scan-byte-patterns \
 - `ok` 在 HEX 与全部模式合法、且没有任何 `count_mismatch` 时为 `true`；
   `absent`/`unique`/`ambiguous` 本身不影响 `ok`。
 
+### `POST /api/v1/inject-page-crc`
+
+按页 CRC 校验表注入：复用同一 Intel HEX 解析器组装映像后，在**按 `page_size` 对齐的
+半开地址范围 `[range_start, range_end)`** 内铺设等大页面网格，把页内**映像未显式给出
+的字节一律按 `0xFF` 物化**，为每页计算一条标准 **IEEE CRC-32**（与 `zlib.crc32` 相同：
+反射多项式 `0xEDB88320`、初值/结果异或 `0xFFFFFFFF`），并把每页一条的 **32 位小端**
+CRC 按页序组成校验表，**并入映像**后以规范化 Intel HEX 返回。
+
+计算任何一页的 CRC 时，**整个校验表区域都按 `0xFF` 处理**——即使该页几何上覆盖表区、
+即使是别的表项的字节——因此 CRC 只反映固件内容，不会把校验表自身计算进去。
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/inject-page-crc \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "hex_text": ":020000040800F2\n:100000000102030405060708090A0B0C0D0E0F1068\n:00000001FF\n",
+    "range_start": 134217728,
+    "range_end": 134217760,
+    "page_size": 16,
+    "table_address": 134217744,
+    "max_data_bytes": 16,
+    "include_entry": true
+  }' | jq
+```
+
+请求参数与前置校验（恒返回 200，以 `ok` 判定）：
+
+- `range_start`/`range_end`：32 位空间（`range_end` 可取 `0x100000000`）内的**非空
+  半开区间**，且两个端点都必须对齐到 `page_size`（正整数；为 0/负或负地址返回 422），
+  否则分别报 `invalid_range` / `range_unaligned`；
+- 页网格数 `(range_end - range_start) / page_size` **不得超过 1,048,576**
+  （`max_pages` 回显上限），否则 `too_many_pages`；
+- `table_address`：校验表起始地址，必须 **4 字节对齐**（表项是 32 位字），否则
+  `table_address_unaligned`；
+- 整张表 `[table_address, table_address + 4*page_count)` 必须**完整位于范围内**
+  （表尾允许恰好等于 `range_end`），否则 `table_out_of_range`（返回实际算出的表区间）；
+- **表区在原映像中必须完全空白**：表区内不得存在任何映像显式给出的字节——
+  **显式写出的 `0xFF` 也算占用**，只有真正缺失（靠 `0xFF` 物化）的字节才被接受；
+  否则按连续占用 run 报告 `table_region_not_empty`，避免静默覆盖固件内容。
+- 与其他接口一致：**HEX 无效时不做任何参数校验、也不注入**——`hex_ok=false`、
+  `params_valid=null`、`pages` 为空、`exported_hex` 为 `null`。表地址未对齐可与
+  范围未对齐/表越界同时报告；区间形状非法时只报 `invalid_range`。
+
+注入与输出语义：
+
+- `pages[]`：按地址升序每页一条，字段为 `index`/`start`/`end`/`size`（恒为
+  `page_size`）/`present_bytes`（该页内**表区之外**由映像显式给出的字节数，表区字节
+  既不计入也不按映像值参与 CRC）/`crc32`（无符号 32 位 IEEE CRC-32）。
+- 成功后小端 CRC 表按页序写入 `table_address`，与原映像字节叠加合并（范围外的映像
+  字节原样保留），最终映像既以 `segments[]`（含 Base64 内容、`segment_count` 与
+  `injected_total_bytes`）返回，也通过与 `/api/v1/export-hex` 完全相同的规范化导出
+  规则输出为 `exported_hex`：`max_data_bytes`（1..255，默认 16）限定数据记录长度、
+  记录不跨 64 KiB 窗口、窗口切换输出类型 04、全部校验和重算；`include_entry`（默认
+  `true`）时保留类型 05 入口记录，并回显 `record_count`/`data_record_count`/
+  `extended_address_record_count`/`entry_record_count`。对导出结果再次规范化导出
+  得到逐字节相同的文本（不动点）。
+- **任一参数错误时不产出结果**：`ok=false`、`params_valid=false`、`pages` 为空、
+  `exported_hex` 为 `null`、各记录数为 0、`segments` 为空，`param_errors` 给出全部
+  参数级问题；`table_end` 在网格无法建立时回显为 `table_address`。
+
+上例（范围 32 字节 = 2 页 × 16；前 16 字节为映像数据，8 字节表放在第二页开头）
+成功响应（节选）：
+
+```json
+{
+  "ok": true,
+  "hex_ok": true,
+  "params_valid": true,
+  "error_count": 0,
+  "warning_count": 0,
+  "entry_address": null,
+  "total_bytes": 16,
+  "range_start": 134217728,
+  "range_end": 134217760,
+  "page_size": 16,
+  "page_count": 2,
+  "table_address": 134217744,
+  "table_end": 134217752,
+  "max_pages": 1048576,
+  "max_data_bytes": 16,
+  "include_entry": true,
+  "pages": [
+    {"index": 0, "start": 134217728, "end": 134217744, "size": 16,
+     "present_bytes": 16, "crc32": 156008689},
+    {"index": 1, "start": 134217744, "end": 134217760, "size": 16,
+     "present_bytes": 0, "crc32": 1068746266}
+  ],
+  "exported_hex": ":020000040800F2\n:100000000102030405060708090A0B0C0D0E0F1068\n:08001000F1804C091AC6B33F50\n:00000001FF\n",
+  "record_count": 4,
+  "data_record_count": 2,
+  "extended_address_record_count": 1,
+  "entry_record_count": 0,
+  "segment_count": 1,
+  "injected_total_bytes": 24,
+  "segments": [
+    {"start": 134217728, "end": 134217752, "size": 24,
+     "data_base64": "AQIDBAUGBwgJCgsMDQ4PEPGATAkaxrM/"}
+  ],
+  "param_errors": [],
+  "diagnostics": [ ... ]
+}
+```
+
+- 同一逻辑映像无论数据记录如何分片，逐页 CRC 与最终映像完全一致——物化后只有
+  「绝对地址 + 字节内容」参与计算；页内表区一律按擦除态 `0xFF` 读，保证校验表
+  自身不会改变任何页 CRC。
+
 ## 解析规则
 
 - 每行必须形如 `:llaaaatt<data>cc`；校验 `ll`（字节数）与实际数据长度一致，
@@ -1015,6 +1126,7 @@ app/
   image_merkle.py # 分块 Merkle 清单（0xFF 物化、u32be 地址叶、奇数层复制末节点、有方向证明，纯逻辑）
   hex_export.py   # Intel HEX 规范化导出（确定性记录重排、64 KiB 窗口切分、校验和重算，纯逻辑）
   pattern_scan.py # 字节模式扫描（token 编译为 value/mask、段内查找不跨空洞、范围/对齐/期望数校验，纯逻辑）
+  page_crc.py     # 按页 IEEE CRC-32 校验表注入（0xFF 物化、表区按 0xFF 计 CRC、小端表并入映像，纯逻辑）
 tests/
   test_hex_service.py           # 解析器与 assemble 接口
   test_validate_layout.py       # validate-layout 接口与布局逻辑
@@ -1027,6 +1139,7 @@ tests/
   test_image_merkle_manifest.py # image-merkle-manifest 接口与分块 Merkle/证明逻辑（物化、复制末节点、折叠验证等）
   test_export_hex.py            # export-hex 接口与规范化导出逻辑（窗口切分、不动点等）
   test_scan_byte_patterns.py    # scan-byte-patterns 接口与模式编译/扫描逻辑（通配、重复、范围/对齐、状态判定等）
+  test_inject_page_crc.py       # inject-page-crc 接口与按页 CRC 注入逻辑（物化、表区按 0xFF、小端并入、空白表区校验等）
 Dockerfile
 docker-compose.yml
 requirements.txt       # 运行依赖
